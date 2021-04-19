@@ -1,4 +1,9 @@
 """Double-Meridian Distance calculator
+
+NOTE: You need to do the chord area like this:
+
+Do DMD area with the CHORD LINE derived from the radial in/out lines.
+Then add the SEGMENT (from CHORD to ARC) AREA.
 """
 
 import csv
@@ -167,19 +172,23 @@ class InnerRadialCurve:
     as well as the constant radius of the curve.
     """
 
-    def __init__(self, azimuth_in, radius, azimuth_out):
+    def __init__(self, azimuth_in, azimuth_out, radius):
         self.azimuth_in = azimuth_in
         self.azimuth_out = azimuth_out
         self.radius = radius
 
     def __repr__(self):
-        return "InnerRadialCurve({0},{1},{2})".format(
-            self.azimuth_in, self.radius, self.azimuth_out)
+        return "InnerRadialCurve(azimuth_in={},azimuth_out={},radius={})".format(
+            self.azimuth_in, self.azimuth_out, self.radius)
 
-    def to_in_out_lines(self):
+    def __str__(self):
+        return "InnerRadialCurve(azimuth_in={},azimuth_out={},radius={},delta:{})".format(
+            self.azimuth_in, self.azimuth_out, self.radius, self.get_delta())
+
+    def get_in_out_lines(self):
         return (
             Line(self.azimuth_in, self.radius),
-            Line(self.azimuth_out. self.radius))
+            Line(self.azimuth_out, self.radius))
 
     def curves_right(self):
         """returns True if this curve curves right or is straight, and False otherwise."""
@@ -188,22 +197,36 @@ class InnerRadialCurve:
         return in_out_diff_degrees < 0.0 or in_out_diff_degrees > 180.0
 
     def get_area(self):
-        return math.abs((self.azimuth_in + AzimuthDMS(180) - self.azimuth_out).to_radians() * self.radius)
+        return self.get_delta().to_radians() * self.radius * self.radius / 2
+
+    def get_delta(self):
+        return AzimuthDMS(abs(self.azimuth_in.to_degrees() + 180.0 - self.azimuth_out.to_degrees()) % 180.0)
+
+    def get_curve_length(self):
+        return self.get_delta().to_radians() * self.radius
 
 
 class DMDCalculationResult:
-    def __init__(self, area, length, lat, dep):
-        self.area = area
-        self.length = length
+    def __init__(self, line_area, line_length, lat, dep, curve_area=0.0, curve_length=0.0):
+        self.line_area = line_area
+        self.line_length = line_length
         self.lat = lat
         self.dep = dep
+        self.curve_area = curve_area
+        self.curve_length = curve_length
+        self.total_area = line_area + curve_area
+        self.total_length = line_length + curve_length
 
     def __repr__(self):
-        return 'DMDCalculationResult(area={},length={},lat={},dep={})'.format(
-            self.area,
-            self.length,
+        return 'DMDCalculationResult(line_area={},line_length={},lat={},dep={},curve_area={},curve_length={},total_area={},total_length={})'.format(
+            self.line_area,
+            self.line_length,
             self.lat,
-            self.dep)
+            self.dep,
+            self.curve_area,
+            self.curve_length,
+            self.total_area,
+            self.total_length)
 
 
 def perform_dmd_calculation(obj_list):
@@ -214,11 +237,12 @@ def perform_dmd_calculation(obj_list):
     variables to allow them to do the update.
     """
 
-    sum_dmd_area, sum_length = 0.0, 0.0
+    sum_line_area, sum_line_length = 0.0, 0.0
+    sum_curve_area, sum_curve_length = 0.0, 0.0
     sum_lat, sum_dep = 0.0, 0.0
     last_dmd, last_dep = 0.0, 0
 
-    def update_calculation_for_line(line):
+    def update_calculation_for_line(line, should_perform_line_sum=True):
         log = logging.getLogger(__name__)
 
         # We use `nonlocal` to be able to refer the the outer variables above in
@@ -226,24 +250,27 @@ def perform_dmd_calculation(obj_list):
         #
         # Otherwise, we would just create new local variables that would vanish
         # while running this function each time.
-        nonlocal sum_dmd_area, sum_length, sum_lat, sum_dep, last_dmd, last_dep
+        nonlocal sum_line_area, sum_line_length, sum_lat, sum_dep, last_dmd, last_dep
         # Get the current line's lat, dep, DMD, area
         (lat, dep) = line.to_lat_dep()
         (dmd, area) = line.to_dmd_area_terms(last_dmd, last_dep)
         log.debug('line={}, lat={}, dep={}, dmd={}, area={}'.format(
             line, lat, dep, dmd, area))
         # Update sums
-        sum_dmd_area += area
         sum_lat += lat
         sum_dep += dep
-        sum_length += line.distance
+        # Update line-specific sums only if needed -- we will use this as a sub-calculation for
+        # inner radial curve calculations too, which won't need this part.
+        if should_perform_line_sum:
+            sum_line_area += area
+            sum_line_length += line.distance
         # Update the last dmd/dep fields before next iteration
         (last_dmd, last_dep) = dmd, dep
 
     def update_calculation_for_inner_radial_curve(curve):
         log = logging.getLogger(__name__)
 
-        nonlocal sum_dmd_area
+        nonlocal sum_line_area, sum_curve_area, sum_curve_length
 
         # For inner radial curves, we want to calculate as if we had the 2 in/out lines
         # first, and then adjust the area sum for the curve after.
@@ -252,17 +279,19 @@ def perform_dmd_calculation(obj_list):
         (line_in, line_out) = curve.get_in_out_lines()
 
         # Calculate the DMD for the line_in and line_out
-        update_calculation_for_line(line_in)
-        update_calculation_for_line(line_out)
+        update_calculation_for_line(line_in, False)
+        update_calculation_for_line(line_out, False)
 
         # Get the curve area, and add/subtract from sum if it curves right/left.
         # (This is because we are doing the traverse clockwise.)
         curve_area = curve.get_area()
-        log.debug("curve={}, curve_area={}".format(curve, curve_area))
+        log.debug("curve={}, area={}".format(curve, curve_area))
         if obj.curves_right():
-            sum_dmd_area -= curve_area
+            sum_curve_area -= curve_area
         else:
-            sum_dmd_area += curve_area
+            sum_curve_area += curve_area
+
+        sum_curve_length += curve.get_curve_length()
 
     # Iterate over the list of objects for the sums
     for obj in obj_list:
@@ -275,14 +304,16 @@ def perform_dmd_calculation(obj_list):
                 '`{}` is not a valid value that can be used in a Double-Meridian Distance calculation.'.format(obj))
 
     # Need to take the absolute value of the sum for area
-    sum_dmd_area = abs(sum_dmd_area)
+    sum_line_area = abs(sum_line_area)
 
     # Return the results
     return DMDCalculationResult(
-        area=sum_dmd_area,
-        length=sum_length,
+        line_area=sum_line_area,
+        line_length=sum_line_length,
         lat=sum_lat,
-        dep=sum_dep)
+        dep=sum_dep,
+        curve_area=sum_curve_area,
+        curve_length=sum_curve_length)
 
 
 def output_report(results):
@@ -308,7 +339,7 @@ def construct_argument_parser():
 
 def config_application_logger(args):
     logging.basicConfig(
-        format='%(asctime)s UTC [%(levelname)s] %(name)s.%(funcName)s: %(message)s',
+        format='%(asctime)s UTC [%(levelname)s] %(funcName)s: %(message)s',
         stream=sys.stderr,
         level=getattr(logging, args.verbosity.upper(), None))
     logging.Formatter.converter = time.gmtime
@@ -333,11 +364,16 @@ def read_input_as_object_list(args):
             #
             # Interpret the current row as a simple radial curve.
             elif len(row) == 3:
-                azimuth_in = AzimuthDMS.from_str(row[0])
-                radius = float(row[1])
-                azimuth_out = AzimuthDMS.from_str(row[2])
-                object_list.append(InnerRadialCurve(
-                    azimuth_in, radius, azimuth_out))
+                if row[2] == '' or row[2] == None:
+                    azimuth = AzimuthDMS.from_str(row[0])
+                    distance = float(row[1])
+                    object_list.append(Line(azimuth, distance))
+                else:
+                    azimuth_in = AzimuthDMS.from_str(row[0])
+                    radius = float(row[1])
+                    azimuth_out = AzimuthDMS.from_str(row[2])
+                    object_list.append(InnerRadialCurve(
+                        azimuth_in=azimuth_in, azimuth_out=azimuth_out, radius=radius))
 
     # Once the data is read, return it.
     return object_list
