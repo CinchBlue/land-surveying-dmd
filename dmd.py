@@ -4,6 +4,9 @@ NOTE: You need to do the chord area like this:
 
 Do DMD area with the CHORD LINE derived from the radial in/out lines.
 Then add the SEGMENT (from CHORD to ARC) AREA.
+
+A = (0.5) * r * r * (theta - sin theta)
+theta = theta [radians]
 """
 
 import csv
@@ -108,10 +111,10 @@ class AzimuthDMS:
         return AzimuthDMS.from_degrees(math.degrees(radians))
 
     def __add__(self, other):
-        return AzimuthDMS.from_degrees(self.to_degrees() + self.to_degrees())
+        return AzimuthDMS.from_degrees(self.to_degrees() + other.to_degrees())
 
     def __sub__(self, other):
-        return AzimuthDMS.from_degrees(self.to_degrees() - self.to_degrees())
+        return AzimuthDMS.from_degrees(self.to_degrees() - other.to_degrees())
 
     def __neg__(self):
         temp = copy.deepcopy(self)
@@ -127,6 +130,9 @@ class AzimuthDMS:
         latitude = math.cos(self.to_radians())
         departure = math.sin(self.to_radians())
         return (latitude, departure)
+
+    def reverse(self):
+        return AzimuthDMS(degrees=self.degrees+180.0, minutes=self.minutes, seconds=self.seconds, sign=self.sign)
 
 
 @classlogger
@@ -163,7 +169,7 @@ class Line:
 
         return (curr_dmd, curr_area)
 
-
+@classlogger
 class InnerRadialCurve:
     """Represents a simple radial curve less than 180 degrees.
 
@@ -194,36 +200,53 @@ class InnerRadialCurve:
         """returns True if this curve curves right or is straight, and False otherwise."""
 
         in_out_diff_degrees = (self.azimuth_in - self.azimuth_out).to_degrees()
-        return in_out_diff_degrees < 0.0 or in_out_diff_degrees > 180.0
+        return in_out_diff_degrees >= 0.0 or in_out_diff_degrees <= 180.0
 
-    def get_area(self):
-        return self.get_delta().to_radians() * self.radius * self.radius / 2
+    def get_chord_triangle_area(self):
+        delta_rad = self.get_delta().to_radians()
+        return (self.radius*self.radius) * math.sin(delta_rad) / 2.0
+
+    def get_sector_area(self):
+        delta_rad = self.get_delta().to_radians()
+        return (delta_rad / 2.0) * self.radius * self.radius
+
+    def get_segment_area(self):
+        return self.get_sector_area() - self.get_chord_triangle_area()
 
     def get_delta(self):
-        return AzimuthDMS(abs(self.azimuth_in.to_degrees() + 180.0 - self.azimuth_out.to_degrees()) % 180.0)
+        return AzimuthDMS.from_degrees(abs(
+            self.azimuth_out.to_degrees() - (self.azimuth_in.reverse().to_degrees()) + 360.0
+        ) % 360.0)
 
     def get_curve_length(self):
         return self.get_delta().to_radians() * self.radius
 
+    def get_chord_line(self):
+        # To get the chord line azimuth, you can subtract half delta from the azimuth in.
+        chord_azimuth = self.azimuth_in - AzimuthDMS.from_degrees(self.get_delta().to_degrees()/2.0)
+        # Long Chord Length = 2 * radius * sin(delta/2)
+        chord_length = 2.0 * self.radius * math.sin(self.get_delta().to_radians() / 2.0)
+        return Line(chord_azimuth, chord_length)
+
 
 class DMDCalculationResult:
-    def __init__(self, line_area, line_length, lat, dep, curve_area=0.0, curve_length=0.0):
+    def __init__(self, line_area, line_length, lat, dep, segment_area=0.0, curve_length=0.0):
         self.line_area = line_area
         self.line_length = line_length
         self.lat = lat
         self.dep = dep
-        self.curve_area = curve_area
+        self.segment_area = segment_area
         self.curve_length = curve_length
-        self.total_area = line_area + curve_area
+        self.total_area = line_area + segment_area
         self.total_length = line_length + curve_length
 
     def __repr__(self):
-        return 'DMDCalculationResult(line_area={},line_length={},lat={},dep={},curve_area={},curve_length={},total_area={},total_length={})'.format(
+        return 'DMDCalculationResult(line_area={},line_length={},lat={},dep={},segment_area={},curve_length={},total_area={},total_length={})'.format(
             self.line_area,
             self.line_length,
             self.lat,
             self.dep,
-            self.curve_area,
+            self.segment_area,
             self.curve_length,
             self.total_area,
             self.total_length)
@@ -236,9 +259,10 @@ def perform_dmd_calculation(obj_list):
     These functions are technically "closures", as they close over the outer environment's
     variables to allow them to do the update.
     """
+    log = logging.getLogger(__name__)
 
     sum_line_area, sum_line_length = 0.0, 0.0
-    sum_curve_area, sum_curve_length = 0.0, 0.0
+    sum_segment_area, sum_curve_length = 0.0, 0.0
     sum_lat, sum_dep = 0.0, 0.0
     last_dmd, last_dep = 0.0, 0
 
@@ -259,10 +283,10 @@ def perform_dmd_calculation(obj_list):
         # Update sums
         sum_lat += lat
         sum_dep += dep
+        sum_line_area += area
         # Update line-specific sums only if needed -- we will use this as a sub-calculation for
         # inner radial curve calculations too, which won't need this part.
         if should_perform_line_sum:
-            sum_line_area += area
             sum_line_length += line.distance
         # Update the last dmd/dep fields before next iteration
         (last_dmd, last_dep) = dmd, dep
@@ -270,26 +294,23 @@ def perform_dmd_calculation(obj_list):
     def update_calculation_for_inner_radial_curve(curve):
         log = logging.getLogger(__name__)
 
-        nonlocal sum_line_area, sum_curve_area, sum_curve_length
+        nonlocal sum_line_area, sum_segment_area, sum_curve_length
 
-        # For inner radial curves, we want to calculate as if we had the 2 in/out lines
-        # first, and then adjust the area sum for the curve after.
+        # For inner radial curves, we want to calculate the chord line DMD
+        # and then account for the curve's segment area from the chord after.
+        chord_line = curve.get_chord_line()
 
-        # Get the two in/out lines and their DMDs + DMD areas
-        (line_in, line_out) = curve.get_in_out_lines()
+        # Calculate the DMD for the chord_line
+        update_calculation_for_line(chord_line, should_perform_line_sum=False)
 
-        # Calculate the DMD for the line_in and line_out
-        update_calculation_for_line(line_in, False)
-        update_calculation_for_line(line_out, False)
-
-        # Get the curve area, and add/subtract from sum if it curves right/left.
+        # Get the curve's segment area, and add/subtract from sum if it curves right/left.
         # (This is because we are doing the traverse clockwise.)
-        curve_area = curve.get_area()
-        log.debug("curve={}, area={}".format(curve, curve_area))
+        segment_area = curve.get_segment_area()
+        log.debug("curve={}, segment_area={}, curves_right={}".format(curve, segment_area, obj.curves_right()))
         if obj.curves_right():
-            sum_curve_area -= curve_area
+            sum_segment_area += segment_area
         else:
-            sum_curve_area += curve_area
+            sum_segment_area -= segment_area
 
         sum_curve_length += curve.get_curve_length()
 
@@ -302,7 +323,14 @@ def perform_dmd_calculation(obj_list):
         else:
             raise ValueError(
                 '`{}` is not a valid value that can be used in a Double-Meridian Distance calculation.'.format(obj))
-
+        log.debug('{}'.format(DMDCalculationResult(
+            line_area=abs(sum_line_area),
+            line_length=sum_line_length,
+            lat=sum_lat,
+            dep=sum_dep,
+            segment_area=sum_segment_area,
+            curve_length=sum_curve_length)))
+        
     # Need to take the absolute value of the sum for area
     sum_line_area = abs(sum_line_area)
 
@@ -312,7 +340,7 @@ def perform_dmd_calculation(obj_list):
         line_length=sum_line_length,
         lat=sum_lat,
         dep=sum_dep,
-        curve_area=sum_curve_area,
+        segment_area=sum_segment_area,
         curve_length=sum_curve_length)
 
 
