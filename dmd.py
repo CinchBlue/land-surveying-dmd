@@ -49,7 +49,7 @@ class AzimuthDMS:
             self.degrees, self.minutes, self.seconds, self.sign)
 
     def __str__(self):
-        return '{}{:.0f}°{:.0f}′{}″'.format(
+        return '{}{:.0f}°{:.0f}\'{}\"'.format(
             self.sign, self.degrees, self.minutes, '{:f}'.format(self.seconds).rstrip('0').rstrip('.'))
 
     def normalize(self):
@@ -88,8 +88,11 @@ class AzimuthDMS:
         sign = '+' if sign is None else sign
         d = 0.0 if d is None else float(d)
         m = 0.0 if m is None else float(m)
+        # This is needed in the case where you have 'DDD.M'. The M is assumed to be the shortened form of 'DDD.M0'.
+        m = 10.0*m if m < 10 and s is None else m
         s = 0.0 if s is None else (float(s) if len(
             s) <= 2 else (float(s[0:2] + "." + s[2:])))
+
         return AzimuthDMS(d, m, s, sign)
 
     def to_degrees(self):
@@ -199,8 +202,8 @@ class InnerRadialCurve:
     def curves_right(self):
         """returns True if this curve curves right or is straight, and False otherwise."""
 
-        in_out_diff_degrees = (self.azimuth_in - self.azimuth_out).to_degrees()
-        return in_out_diff_degrees >= 0.0 or in_out_diff_degrees <= 180.0
+        diff_azimuth = self.azimuth_out.to_degrees() - self.azimuth_in.to_degrees()
+        return (180.0 <= diff_azimuth and diff_azimuth <= 360.0) or (-180.0 <= diff_azimuth and diff_azimuth <= 0.0)
 
     def get_chord_triangle_area(self):
         delta_rad = self.get_delta().to_radians()
@@ -214,16 +217,17 @@ class InnerRadialCurve:
         return self.get_sector_area() - self.get_chord_triangle_area()
 
     def get_delta(self):
-        return AzimuthDMS.from_degrees(abs(
-            self.azimuth_out.to_degrees() - (self.azimuth_in.reverse().to_degrees()) + 360.0
-        ) % 360.0)
+        diff_azimuth = self.azimuth_out.to_degrees() - self.azimuth_in.to_degrees()
+        return AzimuthDMS.from_degrees(
+            abs(180.0 - abs(diff_azimuth)))
 
     def get_curve_length(self):
         return self.get_delta().to_radians() * self.radius
 
     def get_chord_line(self):
-        # To get the chord line azimuth, you can subtract half delta from the azimuth in.
-        chord_azimuth = self.azimuth_in - AzimuthDMS.from_degrees(self.get_delta().to_degrees()/2.0)
+        # To get the chord line azimuth, you can add/subtract half delta with the azimuth out based on curvature.
+        half_delta = AzimuthDMS.from_degrees(self.get_delta().to_degrees()/2.0)
+        chord_azimuth = (self.azimuth_out + half_delta) if self.curves_right() else (self.azimuth_out - half_delta)
         # Long Chord Length = 2 * radius * sin(delta/2)
         chord_length = 2.0 * self.radius * math.sin(self.get_delta().to_radians() / 2.0)
         return Line(chord_azimuth, chord_length)
@@ -241,7 +245,7 @@ class DMDCalculationResult:
         self.total_length = line_length + curve_length
 
     def __repr__(self):
-        return 'DMDCalculationResult(line_area={},line_length={},lat={},dep={},segment_area={},curve_length={},total_area={},total_length={})'.format(
+        return 'DMDCalculationResult(line_area={:.8f},line_length={:.8f},lat={:.8f},dep={:.8f},segment_area={:.8f},curve_length={:.8f},total_area={:.8f},total_length={:.8f})'.format(
             self.line_area,
             self.line_length,
             self.lat,
@@ -323,13 +327,13 @@ def perform_dmd_calculation(obj_list):
         else:
             raise ValueError(
                 '`{}` is not a valid value that can be used in a Double-Meridian Distance calculation.'.format(obj))
-        log.debug('{}'.format(DMDCalculationResult(
-            line_area=abs(sum_line_area),
-            line_length=sum_line_length,
-            lat=sum_lat,
-            dep=sum_dep,
-            segment_area=sum_segment_area,
-            curve_length=sum_curve_length)))
+        #log.debug('{}'.format(DMDCalculationResult(
+        #    line_area=abs(sum_line_area),
+        #    line_length=sum_line_length,
+        #    lat=sum_lat,
+        #    dep=sum_dep,
+        #    segment_area=sum_segment_area,
+        #    curve_length=sum_curve_length)))
         
     # Need to take the absolute value of the sum for area
     sum_line_area = abs(sum_line_area)
